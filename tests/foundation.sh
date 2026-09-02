@@ -127,8 +127,15 @@ test_basic_cli() {
     expect_ok "--version" \
         "$BOOTSTRAP" --version
 
-    expect_ok "default apply mode" \
-        "$BOOTSTRAP"
+    local help_output="$TMP_DIR/help-output"
+
+    if run_capture "$help_output" "$BOOTSTRAP" --help &&
+        grep -Fq 'Apply the desired configuration (default)' "$help_output"; then
+        pass "default apply mode documented"
+    else
+        fail "default apply mode documented"
+        sed 's/^/       /' "$help_output"
+    fi
 
     expect_ok "--plan" \
         "$BOOTSTRAP" --plan
@@ -180,6 +187,12 @@ JOURNAL_MAX_RETENTION="21day"
 
 ALLOW_TCP_PORTS=(80 443)
 ALLOW_UDP_PORTS=(53)
+
+EXTRA_PACKAGES=(
+    tcpdump
+    strace
+    tcpdump
+)
 EOF
 
     expect_ok \
@@ -194,7 +207,8 @@ EOF
         grep -q 'Timezone:.*UTC' "$output_file" &&
         grep -q 'Swap mode:.*fixed' "$output_file" &&
         grep -q 'Swap size:.*2G' "$output_file" &&
-        grep -q 'Allowed TCP ports:.*80 443' "$output_file"; then
+        grep -q 'Allowed TCP ports:.*80 443' "$output_file" &&
+        grep -q 'Extra packages:.*tcpdump strace' "$output_file"; then
         pass "custom config reflected in resolved configuration"
     else
         fail "custom config reflected in resolved configuration"
@@ -236,6 +250,17 @@ EOF
         "invalid reboot time rejected" \
         "AUTO_REBOOT_TIME must use HH:MM" \
         "$BOOTSTRAP" --plan --config "$TMP_DIR/invalid-time.conf"
+
+    cat >"$TMP_DIR/invalid-package.conf" <<'EOF'
+EXTRA_PACKAGES=(
+    "not a package name"
+)
+EOF
+
+    expect_fail_contains \
+        "invalid EXTRA_PACKAGES package name rejected" \
+        "Invalid package name in EXTRA_PACKAGES" \
+        "$BOOTSTRAP" --plan --config "$TMP_DIR/invalid-package.conf"
 }
 
 test_detection_output() {
@@ -282,6 +307,18 @@ test_detection_output() {
         pass "empirical IPv6 state reported"
     else
         fail "empirical IPv6 state reported"
+        sed 's/^/       /' "$output_file"
+    fi
+
+    if grep -Fq '=== PACKAGES / UPDATES ===' "$output_file" &&
+        grep -Fq 'System upgrade:          mandatory' "$output_file" &&
+        grep -Fq 'Release upgrade:         never' "$output_file" &&
+        grep -Fq 'Base packages:' "$output_file" &&
+        grep -Fq 'Missing base packages:' "$output_file" &&
+        grep -Fq 'Upgradeable packages:' "$output_file"; then
+        pass "package/update state reported"
+    else
+        fail "package/update state reported"
         sed 's/^/       /' "$output_file"
     fi
 }

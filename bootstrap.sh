@@ -8,6 +8,31 @@ readonly REQUIRED_OS_ID="ubuntu"
 readonly REQUIRED_OS_VERSION="24.04"
 readonly DEFAULT_LOCAL_CONFIG="./bootstrap.local.conf"
 
+readonly SYSTEM_UPGRADE=true
+readonly APT_LOCK_TIMEOUT_SECONDS=600
+readonly APT_UPDATE_LOCK_RETRY_SECONDS=5
+readonly CLOUD_INIT_WAIT_TIMEOUT_SECONDS=600
+
+readonly -a BASE_PACKAGES=(
+    ca-certificates
+    curl
+    dnsutils
+    git
+    htop
+    iputils-ping
+    jq
+    lsof
+    mtr-tiny
+    netcat-openbsd
+    openssl
+    psmisc
+    rsync
+    traceroute
+    ufw
+    unattended-upgrades
+    unzip
+)
+
 RUN_MODE="apply"
 RUN_MODE_EXPLICIT=false
 CONFIG_PATH=""
@@ -23,6 +48,12 @@ JOURNAL_MAX_USE=""
 JOURNAL_MAX_RETENTION=""
 declare -a ALLOW_TCP_PORTS=()
 declare -a ALLOW_UDP_PORTS=()
+declare -a EXTRA_PACKAGES=()
+
+declare -a RESOLVED_EXTRA_PACKAGES=()
+declare -a CURRENT_MISSING_BASE_PACKAGES=()
+declare -a CURRENT_MISSING_EXTRA_PACKAGES=()
+CURRENT_UPGRADEABLE_COUNT="unknown"
 
 CURRENT_OS_PRETTY=""
 CURRENT_KERNEL=""
@@ -220,11 +251,18 @@ require_commands() {
         apt-get
         date
         df
+        dpkg
+        dpkg-query
         findmnt
         flock
+        grep
         ip
+        mktemp
+        sleep
         systemctl
+        tee
         timedatectl
+        timeout
         uname
     )
 
@@ -265,6 +303,7 @@ set_default_config() {
 
     ALLOW_TCP_PORTS=()
     ALLOW_UDP_PORTS=()
+    EXTRA_PACKAGES=()
 }
 
 load_config() {
@@ -379,6 +418,36 @@ validate_port_array() {
     done
 }
 
+validate_extra_packages() {
+    local declaration=""
+
+    declaration=$(declare -p EXTRA_PACKAGES 2>/dev/null) ||
+        die "Missing configuration array: EXTRA_PACKAGES"
+
+    [[ $declaration == "declare -a "* ]] ||
+        die "EXTRA_PACKAGES must be a Bash indexed array."
+
+    RESOLVED_EXTRA_PACKAGES=()
+
+    local -A seen=()
+    local package=""
+
+    for package in "${BASE_PACKAGES[@]}"; do
+        seen[$package]=1
+    done
+
+    for package in "${EXTRA_PACKAGES[@]}"; do
+        if ! dpkg --validate-thing pkgname "$package" >/dev/null 2>&1; then
+            die "Invalid package name in EXTRA_PACKAGES: '$package'."
+        fi
+
+        if [[ -z ${seen[$package]+x} ]]; then
+            RESOLVED_EXTRA_PACKAGES+=("$package")
+            seen[$package]=1
+        fi
+    done
+}
+
 validate_config() {
     validate_timezone
 
@@ -397,6 +466,7 @@ validate_config() {
 
     validate_port_array "ALLOW_TCP_PORTS"
     validate_port_array "ALLOW_UDP_PORTS"
+    validate_extra_packages
 
     info "Configuration validation passed."
 }
@@ -594,6 +664,57 @@ detect_ipv6_state() {
     )
 }
 
+is_package_installed() {
+    local package=$1
+    local status=""
+
+    status=$(
+        dpkg-query \
+            --show \
+            --showformat='${Status}' \
+            -- "$package" 2>/dev/null || true
+    )
+
+    [[ $status == "install ok installed" ]]
+}
+
+detect_package_state() {
+    CURRENT_MISSING_BASE_PACKAGES=()
+    CURRENT_MISSING_EXTRA_PACKAGES=()
+    CURRENT_UPGRADEABLE_COUNT="unknown"
+
+    local package=""
+
+    for package in "${BASE_PACKAGES[@]}"; do
+        if ! is_package_installed "$package"; then
+            CURRENT_MISSING_BASE_PACKAGES+=("$package")
+        fi
+    done
+
+    for package in "${RESOLVED_EXTRA_PACKAGES[@]}"; do
+        if ! is_package_installed "$package"; then
+            CURRENT_MISSING_EXTRA_PACKAGES+=("$package")
+        fi
+    done
+
+    local simulation=""
+
+    if simulation=$(
+        env \
+            DEBIAN_FRONTEND=noninteractive \
+            LC_ALL=C \
+            apt-get \
+                --simulate \
+                -o Debug::NoLocking=1 \
+                upgrade \
+                --with-new-pkgs 2>/dev/null
+    ); then
+        CURRENT_UPGRADEABLE_COUNT=$(
+            grep -c '^Inst ' <<<"$simulation" || true
+        )
+    fi
+}
+
 detect_system_state() {
     info "Detecting current system state."
 
@@ -602,6 +723,7 @@ detect_system_state() {
     detect_time_state
     detect_systemd_state
     detect_ipv6_state
+    detect_package_state
 
     info "Current system state detection completed."
 }
@@ -673,6 +795,59 @@ print_current_state() {
     done
 }
 
+print_package_list() {
+    local label=$1
+    shift
+
+    printf '%-25s' "$label"
+
+    if (($# == 0)); then
+        printf '<none>\n'
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+print_package_state() {
+    printf '\n'
+    printf '=== PACKAGES / UPDATES ===\n'
+
+    printf 'System upgrade:          mandatory\n'
+    printf 'Release upgrade:         never\n'
+    printf 'APT frontend:            apt-get\n'
+    printf 'APT environment:         DEBIAN_FRONTEND=noninteractive\n'
+    printf 'Upgrade strategy:        upgrade --with-new-pkgs\n'
+    printf 'Package removals:        not allowed by upgrade strategy\n'
+    printf 'Phased updates:          respected\n'
+    printf 'Package holds:           respected\n'
+    printf 'APT lock wait:           %s seconds\n' "$APT_LOCK_TIMEOUT_SECONDS"
+
+    printf 'Base packages:           %s\n' "${#BASE_PACKAGES[@]}"
+    printf 'Missing base packages:   %s\n' \
+        "${#CURRENT_MISSING_BASE_PACKAGES[@]}"
+
+    print_package_list \
+        '  missing base:' \
+        "${CURRENT_MISSING_BASE_PACKAGES[@]}"
+
+    printf 'Extra packages:          %s\n' \
+        "${#RESOLVED_EXTRA_PACKAGES[@]}"
+
+    print_package_list \
+        '  configured extra:' \
+        "${RESOLVED_EXTRA_PACKAGES[@]}"
+
+    printf 'Missing extra packages:  %s\n' \
+        "${#CURRENT_MISSING_EXTRA_PACKAGES[@]}"
+
+    print_package_list \
+        '  missing extra:' \
+        "${CURRENT_MISSING_EXTRA_PACKAGES[@]}"
+
+    printf 'Upgradeable packages:    %s (current APT index)\n' \
+        "$CURRENT_UPGRADEABLE_COUNT"
+}
+
 print_resolved_config() {
     printf '\n'
     printf '=== RESOLVED CONFIGURATION ===\n'
@@ -700,6 +875,13 @@ print_resolved_config() {
     else
         printf '%s\n' "${ALLOW_UDP_PORTS[*]}"
     fi
+
+    printf 'Extra packages:          '
+    if ((${#RESOLVED_EXTRA_PACKAGES[@]} == 0)); then
+        printf '<none>\n'
+    else
+        printf '%s\n' "${RESOLVED_EXTRA_PACKAGES[*]}"
+    fi
 }
 
 print_runtime_summary() {
@@ -711,21 +893,186 @@ print_runtime_summary() {
     printf 'Effective UID:           %s\n' "$EUID"
 }
 
+wait_for_cloud_init() {
+    if ! command -v cloud-init >/dev/null 2>&1; then
+        info "cloud-init is not installed; skipping cloud-init wait."
+        return
+    fi
+
+    info "Waiting for cloud-init to finish."
+
+    if timeout \
+        --foreground \
+        "${CLOUD_INIT_WAIT_TIMEOUT_SECONDS}s" \
+        cloud-init status --wait; then
+        info "cloud-init completed successfully."
+        return
+    fi
+
+    local exit_code=$?
+
+    if ((exit_code == 124)); then
+        die "Timed out waiting for cloud-init after ${CLOUD_INIT_WAIT_TIMEOUT_SECONDS} seconds."
+    fi
+
+    warn "cloud-init completed with a non-zero status (${exit_code}); continuing after completion."
+}
+
+apt_get() {
+    env \
+        DEBIAN_FRONTEND=noninteractive \
+        LC_ALL=C \
+        apt-get \
+            -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT_SECONDS}" \
+            "$@"
+}
+
+apt_get_dpkg_safe() {
+    apt_get \
+        -o 'Dpkg::Options::=--force-confdef' \
+        -o 'Dpkg::Options::=--force-confold' \
+        "$@"
+}
+
+apt_update_with_lock_retry() {
+    local output_file=""
+    output_file=$(mktemp)
+
+    local deadline=$((SECONDS + APT_LOCK_TIMEOUT_SECONDS))
+
+    while true; do
+        : >"$output_file"
+
+        info "Refreshing APT package index."
+
+        if apt_get \
+            update \
+            --error-on=any \
+            2>&1 | tee "$output_file"; then
+            rm -f -- "$output_file"
+            info "APT package index refreshed successfully."
+            return
+        fi
+
+        if grep -Eq \
+            'Could not get lock|Unable to acquire.*lock|Could not open lock file' \
+            "$output_file"; then
+
+            if ((SECONDS >= deadline)); then
+                rm -f -- "$output_file"
+                die "Timed out waiting for APT package-index lock."
+            fi
+
+            warn "APT package index is locked by another process; retrying in ${APT_UPDATE_LOCK_RETRY_SECONDS}s."
+            sleep "$APT_UPDATE_LOCK_RETRY_SECONDS"
+            continue
+        fi
+
+        rm -f -- "$output_file"
+        die "apt-get update failed."
+    done
+}
+
+upgrade_system_packages() {
+    [[ $SYSTEM_UPGRADE == true ]] ||
+        die "Internal policy error: SYSTEM_UPGRADE must remain enabled."
+
+    info "Applying safe Ubuntu 24.04 package upgrades."
+
+    apt_get_dpkg_safe \
+        upgrade \
+        --with-new-pkgs \
+        --assume-yes
+
+    info "Safe package upgrade completed."
+}
+
+collect_missing_packages() {
+    local -n result_ref=$1
+
+    result_ref=(
+        "${CURRENT_MISSING_BASE_PACKAGES[@]}"
+        "${CURRENT_MISSING_EXTRA_PACKAGES[@]}"
+    )
+}
+
+install_missing_packages() {
+    detect_package_state
+
+    local -a missing_packages=()
+    collect_missing_packages missing_packages
+
+    if ((${#missing_packages[@]} == 0)); then
+        info "All configured base and extra packages are already installed."
+        return
+    fi
+
+    info "Installing ${#missing_packages[@]} missing package(s): ${missing_packages[*]}"
+
+    apt_get_dpkg_safe \
+        install \
+        --assume-yes \
+        -- \
+        "${missing_packages[@]}"
+
+    info "Configured package installation completed."
+}
+
+verify_package_manager_health() {
+    info "Checking APT dependency health."
+
+    apt_get check
+
+    local audit_output=""
+
+    if ! audit_output=$(dpkg --audit 2>&1); then
+        printf '%s\n' "$audit_output" >&2
+        die "dpkg audit failed."
+    fi
+
+    if [[ -n ${audit_output//[[:space:]]/} ]]; then
+        printf '%s\n' "$audit_output" >&2
+        die "dpkg audit reported an inconsistent package state."
+    fi
+
+    info "APT/dpkg health checks passed."
+}
+
+apply_packages_and_updates() {
+    info "Starting mandatory packages/system-update module."
+
+    wait_for_cloud_init
+
+    apt_update_with_lock_retry
+    upgrade_system_packages
+    install_missing_packages
+    verify_package_manager_health
+
+    detect_systemd_state
+    detect_package_state
+
+    printf '\n'
+    printf '=== PACKAGES / UPDATES AFTER APPLY ===\n'
+    print_package_state
+
+    info "Packages/system-update module completed."
+}
+
 run_current_mode() {
     case "$RUN_MODE" in
         apply)
             info "Apply mode selected."
-            info "Foundation checks passed. No system-changing modules are implemented yet."
+            apply_packages_and_updates
             ;;
 
         plan)
             info "Plan mode selected."
-            info "Foundation checks passed. No system-changing modules are implemented yet."
+            info "No system changes were made."
             ;;
 
         audit)
             info "Audit mode selected."
-            info "Foundation checks passed. Audit modules are not implemented yet."
+            info "Package state was inspected read-only; no system changes were made."
             ;;
 
         *)
@@ -752,6 +1099,7 @@ main() {
     print_runtime_summary
     print_current_state
     print_resolved_config
+    print_package_state
 
     run_current_mode
 }

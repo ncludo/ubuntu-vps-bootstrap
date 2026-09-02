@@ -18,3 +18,14 @@ JOURNAL_MAX_RETENTION="14day"
 
 ALLOW_TCP_PORTS=()
 ALLOW_UDP_PORTS=()
+
+# Optional packages installed in addition to the fixed project BASE_PACKAGES.
+#
+# This is intentionally empty in the public project defaults.
+#
+# Example:
+# EXTRA_PACKAGES=(
+#     tcpdump
+#     strace
+# )
+EXTRA_PACKAGES=()
