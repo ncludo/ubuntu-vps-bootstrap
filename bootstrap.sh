@@ -12,6 +12,8 @@ readonly SYSTEM_UPGRADE=true
 readonly APT_LOCK_TIMEOUT_SECONDS=600
 readonly APT_UPDATE_LOCK_RETRY_SECONDS=5
 readonly CLOUD_INIT_WAIT_TIMEOUT_SECONDS=600
+readonly SWAP_FILE_PATH="/swapfile"
+readonly SWAP_DISK_RESERVE_MIB=1024
 
 readonly -a BASE_PACKAGES=(
     ca-certificates
@@ -144,7 +146,7 @@ Notes:
   Configuration files are trusted Bash configuration and are sourced
   with root privileges.
 
-  Apply mode currently configures packages/system updates and timezone/NTP.
+  Apply mode currently configures packages/system updates, timezone/NTP, and swap.
   Other baseline modules remain under development.
 EOF
 }
@@ -264,6 +266,14 @@ require_commands() {
         timedatectl
         timeout
         uname
+        chmod
+        cp
+        dd
+        mkswap
+        rm
+        stat
+        swapoff
+        swapon
     )
 
     local command_name
@@ -1106,12 +1116,246 @@ apply_timezone_and_ntp() {
     info "Timezone/NTP module completed."
 }
 
+swap_size_to_kib() {
+    local value=${1^^}
+    local number=${value%?}
+    local unit=${value: -1}
+
+    case "$unit" in
+        K)
+            printf '%s\n' "$((10#$number))"
+            ;;
+        M)
+            printf '%s\n' "$((10#$number * 1024))"
+            ;;
+        G)
+            printf '%s\n' "$((10#$number * 1024 * 1024))"
+            ;;
+        T)
+            printf '%s\n' "$((10#$number * 1024 * 1024 * 1024))"
+            ;;
+        P)
+            printf '%s\n' "$((10#$number * 1024 * 1024 * 1024 * 1024))"
+            ;;
+        *)
+            die "Unable to convert swap size '$1'."
+            ;;
+    esac
+}
+
+resolve_auto_swap_size() {
+    local desired_mib=0
+    local maximum_safe_mib=0
+    local target_mib=0
+
+    if ((CURRENT_RAM_TOTAL_MIB <= 4096)); then
+        desired_mib=2048
+    else
+        desired_mib=4096
+    fi
+
+    if ((CURRENT_ROOT_AVAIL_MIB > SWAP_DISK_RESERVE_MIB)); then
+        maximum_safe_mib=$((CURRENT_ROOT_AVAIL_MIB - SWAP_DISK_RESERVE_MIB))
+    fi
+
+    if ((maximum_safe_mib >= desired_mib)); then
+        target_mib=$desired_mib
+    elif ((maximum_safe_mib >= 1024)); then
+        target_mib=1024
+    elif ((maximum_safe_mib >= 512)); then
+        target_mib=512
+    else
+        die \
+            "Insufficient disk space for automatic swap while preserving ${SWAP_DISK_RESERVE_MIB} MiB free."
+    fi
+
+    case "$target_mib" in
+        4096)
+            printf '4G\n'
+            ;;
+        2048)
+            printf '2G\n'
+            ;;
+        1024)
+            printf '1G\n'
+            ;;
+        512)
+            printf '512M\n'
+            ;;
+        *)
+            die "Unexpected automatic swap size: ${target_mib} MiB."
+            ;;
+    esac
+}
+
+apply_swap() {
+    info "Starting swap module."
+
+    detect_resource_state
+
+    if [[ $SWAP_MODE == disabled ]]; then
+        info "Swap creation is disabled; existing swap is preserved."
+        info "Swap module completed."
+        return
+    fi
+
+    if ((CURRENT_SWAP_DEVICE_COUNT > 0 || CURRENT_SWAP_TOTAL_MIB > 0)); then
+        info \
+            "Existing active swap detected (${CURRENT_SWAP_TOTAL_MIB} MiB, ${CURRENT_SWAP_DEVICE_COUNT} device(s)); preserving it."
+        info "Swap module completed."
+        return
+    fi
+
+    if [[ -e $SWAP_FILE_PATH ]]; then
+        die \
+            "$SWAP_FILE_PATH already exists while no active swap was detected; refusing to overwrite it."
+    fi
+
+    if grep -Ev \
+        '^[[:space:]]*(#|$)' \
+        /etc/fstab |
+        grep -Eq '[[:space:]]swap[[:space:]]'; then
+        die \
+            "/etc/fstab contains configured but inactive swap; refusing to create a second swap configuration."
+    fi
+
+    case "$CURRENT_ROOT_FSTYPE" in
+        ext4 | xfs) ;;
+        btrfs)
+            die "Automatic swapfile creation on btrfs is outside this baseline."
+            ;;
+        *)
+            die \
+                "Unsupported root filesystem for managed swapfile: $CURRENT_ROOT_FSTYPE"
+            ;;
+    esac
+
+    local target_size=""
+    local target_kib=0
+    local target_mib=0
+
+    case "$SWAP_MODE" in
+        auto)
+            target_size=$(resolve_auto_swap_size)
+
+            info \
+                "Automatic swap target: ${target_size} (RAM ${CURRENT_RAM_TOTAL_MIB} MiB, root available ${CURRENT_ROOT_AVAIL_MIB} MiB)."
+            ;;
+        fixed)
+            target_size=${SWAP_SIZE^^}
+            info "Fixed swap target: $target_size."
+            ;;
+        *)
+            die "Unexpected SWAP_MODE '$SWAP_MODE'."
+            ;;
+    esac
+
+    target_kib=$(swap_size_to_kib "$target_size")
+    target_mib=$(((target_kib + 1023) / 1024))
+
+    if ((CURRENT_ROOT_AVAIL_MIB < target_mib + SWAP_DISK_RESERVE_MIB)); then
+        die \
+            "Insufficient disk space for ${target_size} swap while preserving ${SWAP_DISK_RESERVE_MIB} MiB free."
+    fi
+
+    local dd_bs=""
+    local dd_count=0
+
+    if ((target_kib % 1024 == 0)); then
+        dd_bs="1M"
+        dd_count=$((target_kib / 1024))
+    else
+        dd_bs="1K"
+        dd_count=$target_kib
+    fi
+
+    info "Creating managed swapfile: $SWAP_FILE_PATH ($target_size)."
+
+    if ! dd \
+        if=/dev/zero \
+        of="$SWAP_FILE_PATH" \
+        bs="$dd_bs" \
+        count="$dd_count" \
+        conv=fsync \
+        status=none; then
+        rm -f "$SWAP_FILE_PATH"
+        die "Failed to allocate $SWAP_FILE_PATH."
+    fi
+
+    chmod 600 "$SWAP_FILE_PATH"
+
+    if ! mkswap "$SWAP_FILE_PATH" >/dev/null; then
+        rm -f "$SWAP_FILE_PATH"
+        die "Failed to initialize $SWAP_FILE_PATH."
+    fi
+
+    local fstab_backup=""
+    local fstab_entry="$SWAP_FILE_PATH none swap sw 0 0"
+
+    fstab_backup=$(mktemp /etc/fstab.bootstrap.swap.XXXXXX)
+
+    if ! cp \
+        --preserve=mode,ownership,timestamps \
+        /etc/fstab \
+        "$fstab_backup"; then
+        rm -f "$fstab_backup" "$SWAP_FILE_PATH"
+        die "Failed to back up /etc/fstab."
+    fi
+
+    if ! printf '%s\n' "$fstab_entry" >>/etc/fstab; then
+        cp "$fstab_backup" /etc/fstab
+        rm -f "$SWAP_FILE_PATH"
+        die "Failed to update /etc/fstab."
+    fi
+
+    if ! swapon "$SWAP_FILE_PATH"; then
+        cp "$fstab_backup" /etc/fstab
+        rm -f "$SWAP_FILE_PATH"
+        die "Failed to activate $SWAP_FILE_PATH."
+    fi
+
+    detect_resource_state
+
+    local permission=""
+    local fstab_entry_count=0
+
+    permission=$(stat -c '%a' "$SWAP_FILE_PATH")
+
+    fstab_entry_count=$(
+        grep -Fxc "$fstab_entry" /etc/fstab || true
+    )
+
+    if ((CURRENT_SWAP_DEVICE_COUNT == 0 || CURRENT_SWAP_TOTAL_MIB == 0)) ||
+        [[ $permission != 600 ]] ||
+        [[ $fstab_entry_count -ne 1 ]]; then
+
+        swapoff "$SWAP_FILE_PATH" 2>/dev/null || true
+        cp "$fstab_backup" /etc/fstab
+        rm -f "$SWAP_FILE_PATH"
+
+        die "Swap post-apply verification failed; changes were rolled back."
+    fi
+
+    printf '\n'
+    printf '=== SWAP AFTER APPLY ===\n'
+    printf 'Swap total:              %s MiB\n' "$CURRENT_SWAP_TOTAL_MIB"
+    printf 'Swap used:               %s MiB\n' "$CURRENT_SWAP_USED_MIB"
+    printf 'Active swap devices:     %s\n' "$CURRENT_SWAP_DEVICE_COUNT"
+    printf 'Managed swapfile:        %s\n' "$SWAP_FILE_PATH"
+    printf 'Swapfile permissions:    %s\n' "$permission"
+    printf 'fstab entry count:       %s\n' "$fstab_entry_count"
+    printf 'fstab backup:            %s\n' "$fstab_backup"
+
+    info "Swap module completed."
+}
+
 run_current_mode() {
     case "$RUN_MODE" in
         apply)
             info "Apply mode selected."
             apply_packages_and_updates
             apply_timezone_and_ntp
+            apply_swap
             ;;
 
         plan)
