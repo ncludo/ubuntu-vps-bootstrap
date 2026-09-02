@@ -24,6 +24,35 @@ JOURNAL_MAX_RETENTION=""
 declare -a ALLOW_TCP_PORTS=()
 declare -a ALLOW_UDP_PORTS=()
 
+CURRENT_OS_PRETTY=""
+CURRENT_KERNEL=""
+CURRENT_UPTIME_SECONDS=0
+
+CURRENT_RAM_TOTAL_MIB=0
+CURRENT_SWAP_TOTAL_MIB=0
+CURRENT_SWAP_USED_MIB=0
+CURRENT_SWAP_DEVICE_COUNT=0
+
+CURRENT_ROOT_SOURCE=""
+CURRENT_ROOT_FSTYPE=""
+CURRENT_ROOT_TOTAL_MIB=0
+CURRENT_ROOT_USED_MIB=0
+CURRENT_ROOT_AVAIL_MIB=0
+CURRENT_ROOT_USE_PERCENT=""
+
+CURRENT_TIMEZONE=""
+CURRENT_NTP_ENABLED="unknown"
+CURRENT_NTP_SYNCHRONIZED="unknown"
+
+CURRENT_REBOOT_REQUIRED=false
+declare -a CURRENT_FAILED_UNITS=()
+
+CURRENT_IPV6_SYSCTL_AVAILABLE=false
+declare -a CURRENT_IPV6_DISABLE_STATE=()
+declare -a CURRENT_IPV6_ADDRESSES=()
+declare -a CURRENT_IPV6_GLOBAL_ADDRESSES=()
+declare -a CURRENT_IPV6_ROUTES=()
+
 log() {
     local level=$1
     shift
@@ -190,8 +219,12 @@ require_commands() {
     local -a required_commands=(
         apt-get
         date
+        df
+        findmnt
         flock
+        ip
         systemctl
+        timedatectl
         uname
     )
 
@@ -368,6 +401,278 @@ validate_config() {
     info "Configuration validation passed."
 }
 
+detect_os_state() {
+    # /etc/os-release was already validated by require_supported_os().
+    # shellcheck disable=SC1091
+    source /etc/os-release
+
+    CURRENT_OS_PRETTY=${PRETTY_NAME:-Ubuntu}
+    CURRENT_KERNEL=$(uname -r)
+
+    local uptime_raw=""
+
+    read -r uptime_raw _ </proc/uptime ||
+        die "Unable to read /proc/uptime."
+
+    CURRENT_UPTIME_SECONDS=${uptime_raw%%.*}
+}
+
+detect_resource_state() {
+    local mem_total_kib=0
+    local swap_total_kib=0
+    local swap_free_kib=0
+    local key=""
+    local value=""
+
+    while read -r key value _; do
+        case "$key" in
+            MemTotal:)
+                mem_total_kib=$value
+                ;;
+            SwapTotal:)
+                swap_total_kib=$value
+                ;;
+            SwapFree:)
+                swap_free_kib=$value
+                ;;
+        esac
+    done </proc/meminfo
+
+    [[ $mem_total_kib =~ ^[0-9]+$ ]] ||
+        die "Unable to detect total RAM."
+
+    [[ $swap_total_kib =~ ^[0-9]+$ ]] ||
+        die "Unable to detect total swap."
+
+    [[ $swap_free_kib =~ ^[0-9]+$ ]] ||
+        die "Unable to detect free swap."
+
+    CURRENT_RAM_TOTAL_MIB=$((mem_total_kib / 1024))
+    CURRENT_SWAP_TOTAL_MIB=$((swap_total_kib / 1024))
+    CURRENT_SWAP_USED_MIB=$(((swap_total_kib - swap_free_kib) / 1024))
+
+    CURRENT_SWAP_DEVICE_COUNT=0
+
+    if [[ -r /proc/swaps ]]; then
+        local line=""
+        local line_number=0
+
+        while IFS= read -r line; do
+            if ((line_number == 0)); then
+                line_number=1
+                continue
+            fi
+
+            if [[ -n $line ]]; then
+                CURRENT_SWAP_DEVICE_COUNT=$((CURRENT_SWAP_DEVICE_COUNT + 1))
+            fi
+        done </proc/swaps
+    fi
+
+    read -r CURRENT_ROOT_SOURCE CURRENT_ROOT_FSTYPE < <(
+        findmnt -n -o SOURCE,FSTYPE /
+    ) || die "Unable to detect root filesystem."
+
+    local -a df_lines=()
+    mapfile -t df_lines < <(
+        df -B1 --output=size,used,avail,pcent /
+    )
+
+    ((${#df_lines[@]} >= 2)) ||
+        die "Unable to detect root filesystem usage."
+
+    local root_size_bytes=0
+    local root_used_bytes=0
+    local root_avail_bytes=0
+
+    read -r \
+        root_size_bytes \
+        root_used_bytes \
+        root_avail_bytes \
+        CURRENT_ROOT_USE_PERCENT \
+        <<<"${df_lines[1]}"
+
+    [[ $root_size_bytes =~ ^[0-9]+$ ]] ||
+        die "Invalid root filesystem size."
+
+    [[ $root_used_bytes =~ ^[0-9]+$ ]] ||
+        die "Invalid root filesystem used size."
+
+    [[ $root_avail_bytes =~ ^[0-9]+$ ]] ||
+        die "Invalid root filesystem available size."
+
+    CURRENT_ROOT_TOTAL_MIB=$((root_size_bytes / 1024 / 1024))
+    CURRENT_ROOT_USED_MIB=$((root_used_bytes / 1024 / 1024))
+    CURRENT_ROOT_AVAIL_MIB=$((root_avail_bytes / 1024 / 1024))
+}
+
+detect_time_state() {
+    CURRENT_TIMEZONE=$(
+        timedatectl show \
+            --property=Timezone \
+            --value 2>/dev/null || true
+    )
+
+    CURRENT_NTP_ENABLED=$(
+        timedatectl show \
+            --property=NTP \
+            --value 2>/dev/null || true
+    )
+
+    CURRENT_NTP_SYNCHRONIZED=$(
+        timedatectl show \
+            --property=NTPSynchronized \
+            --value 2>/dev/null || true
+    )
+
+    [[ -n $CURRENT_TIMEZONE ]] ||
+        CURRENT_TIMEZONE="unknown"
+
+    [[ -n $CURRENT_NTP_ENABLED ]] ||
+        CURRENT_NTP_ENABLED="unknown"
+
+    [[ -n $CURRENT_NTP_SYNCHRONIZED ]] ||
+        CURRENT_NTP_SYNCHRONIZED="unknown"
+}
+
+detect_systemd_state() {
+    if [[ -e /var/run/reboot-required ]]; then
+        CURRENT_REBOOT_REQUIRED=true
+    else
+        CURRENT_REBOOT_REQUIRED=false
+    fi
+
+    CURRENT_FAILED_UNITS=()
+
+    mapfile -t CURRENT_FAILED_UNITS < <(
+        systemctl \
+            --failed \
+            --no-legend \
+            --plain 2>/dev/null || true
+    )
+}
+
+detect_ipv6_state() {
+    CURRENT_IPV6_SYSCTL_AVAILABLE=false
+    CURRENT_IPV6_DISABLE_STATE=()
+    CURRENT_IPV6_ADDRESSES=()
+    CURRENT_IPV6_GLOBAL_ADDRESSES=()
+    CURRENT_IPV6_ROUTES=()
+
+    if [[ -d /proc/sys/net/ipv6/conf ]]; then
+        CURRENT_IPV6_SYSCTL_AVAILABLE=true
+
+        local path=""
+        local interface_name=""
+        local value=""
+
+        for path in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+            [[ -r $path ]] || continue
+
+            read -r value <"$path" ||
+                die "Unable to read IPv6 sysctl state: $path"
+
+            interface_name=${path%/disable_ipv6}
+            interface_name=${interface_name##*/}
+
+            CURRENT_IPV6_DISABLE_STATE+=(
+                "${interface_name}=${value}"
+            )
+        done
+    fi
+
+    mapfile -t CURRENT_IPV6_ADDRESSES < <(
+        ip -6 -o address show 2>/dev/null || true
+    )
+
+    mapfile -t CURRENT_IPV6_GLOBAL_ADDRESSES < <(
+        ip -6 -o address show scope global 2>/dev/null || true
+    )
+
+    mapfile -t CURRENT_IPV6_ROUTES < <(
+        ip -6 route show 2>/dev/null || true
+    )
+}
+
+detect_system_state() {
+    info "Detecting current system state."
+
+    detect_os_state
+    detect_resource_state
+    detect_time_state
+    detect_systemd_state
+    detect_ipv6_state
+
+    info "Current system state detection completed."
+}
+
+print_current_state() {
+    printf '\n'
+    printf '=== CURRENT STATE ===\n'
+
+    printf 'OS:                      %s\n' "$CURRENT_OS_PRETTY"
+    printf 'Kernel:                  %s\n' "$CURRENT_KERNEL"
+    printf 'Uptime:                  %s seconds\n' "$CURRENT_UPTIME_SECONDS"
+
+    printf 'RAM total:               %s MiB\n' "$CURRENT_RAM_TOTAL_MIB"
+    printf 'Swap total:              %s MiB\n' "$CURRENT_SWAP_TOTAL_MIB"
+    printf 'Swap used:               %s MiB\n' "$CURRENT_SWAP_USED_MIB"
+    printf 'Active swap devices:     %s\n' "$CURRENT_SWAP_DEVICE_COUNT"
+
+    printf 'Root filesystem:         %s (%s)\n' \
+        "$CURRENT_ROOT_SOURCE" \
+        "$CURRENT_ROOT_FSTYPE"
+
+    printf 'Root total:              %s MiB\n' "$CURRENT_ROOT_TOTAL_MIB"
+    printf 'Root used:               %s MiB\n' "$CURRENT_ROOT_USED_MIB"
+    printf 'Root available:          %s MiB\n' "$CURRENT_ROOT_AVAIL_MIB"
+    printf 'Root usage:              %s\n' "$CURRENT_ROOT_USE_PERCENT"
+
+    printf 'Current timezone:        %s\n' "$CURRENT_TIMEZONE"
+    printf 'NTP enabled:             %s\n' "$CURRENT_NTP_ENABLED"
+    printf 'NTP synchronized:        %s\n' "$CURRENT_NTP_SYNCHRONIZED"
+
+    printf 'Reboot required:         %s\n' "$CURRENT_REBOOT_REQUIRED"
+    printf 'Failed systemd units:    %s\n' "${#CURRENT_FAILED_UNITS[@]}"
+
+    local unit=""
+
+    for unit in "${CURRENT_FAILED_UNITS[@]}"; do
+        printf '  failed: %s\n' "$unit"
+    done
+
+    printf 'IPv6 sysctl available:   %s\n' "$CURRENT_IPV6_SYSCTL_AVAILABLE"
+
+    printf 'IPv6 disable state:      '
+
+    if ((${#CURRENT_IPV6_DISABLE_STATE[@]} == 0)); then
+        printf '<none>\n'
+    else
+        printf '%s\n' "${CURRENT_IPV6_DISABLE_STATE[*]}"
+    fi
+
+    printf 'IPv6 addresses:          %s\n' "${#CURRENT_IPV6_ADDRESSES[@]}"
+
+    local item=""
+
+    for item in "${CURRENT_IPV6_ADDRESSES[@]}"; do
+        printf '  addr: %s\n' "$item"
+    done
+
+    printf 'IPv6 global addresses:   %s\n' \
+        "${#CURRENT_IPV6_GLOBAL_ADDRESSES[@]}"
+
+    for item in "${CURRENT_IPV6_GLOBAL_ADDRESSES[@]}"; do
+        printf '  global: %s\n' "$item"
+    done
+
+    printf 'IPv6 routes:             %s\n' "${#CURRENT_IPV6_ROUTES[@]}"
+
+    for item in "${CURRENT_IPV6_ROUTES[@]}"; do
+        printf '  route: %s\n' "$item"
+    done
+}
+
 print_resolved_config() {
     printf '\n'
     printf '=== RESOLVED CONFIGURATION ===\n'
@@ -442,7 +747,10 @@ main() {
     load_config
     validate_config
 
+    detect_system_state
+
     print_runtime_summary
+    print_current_state
     print_resolved_config
 
     run_current_mode

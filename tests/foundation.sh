@@ -238,6 +238,54 @@ EOF
         "$BOOTSTRAP" --plan --config "$TMP_DIR/invalid-time.conf"
 }
 
+test_detection_output() {
+    echo
+    echo "=== CURRENT STATE DETECTION ==="
+
+    local output_file="$TMP_DIR/detection-output"
+
+    if run_capture "$output_file" "$BOOTSTRAP" --plan; then
+        pass "current-state detection run succeeds"
+    else
+        fail "current-state detection run succeeds"
+        sed 's/^/       /' "$output_file"
+        return
+    fi
+
+    if grep -Fq '=== CURRENT STATE ===' "$output_file" &&
+        grep -Fq 'OS:' "$output_file" &&
+        grep -Fq 'Kernel:' "$output_file" &&
+        grep -Fq 'RAM total:' "$output_file" &&
+        grep -Fq 'Root filesystem:' "$output_file"; then
+        pass "system and resource state reported"
+    else
+        fail "system and resource state reported"
+        sed 's/^/       /' "$output_file"
+    fi
+
+    if grep -Fq 'Current timezone:' "$output_file" &&
+        grep -Fq 'NTP enabled:' "$output_file" &&
+        grep -Fq 'NTP synchronized:' "$output_file" &&
+        grep -Fq 'Reboot required:' "$output_file" &&
+        grep -Fq 'Failed systemd units:' "$output_file"; then
+        pass "time and systemd state reported"
+    else
+        fail "time and systemd state reported"
+        sed 's/^/       /' "$output_file"
+    fi
+
+    if grep -Fq 'IPv6 sysctl available:' "$output_file" &&
+        grep -Fq 'IPv6 disable state:' "$output_file" &&
+        grep -Fq 'IPv6 addresses:' "$output_file" &&
+        grep -Fq 'IPv6 global addresses:' "$output_file" &&
+        grep -Fq 'IPv6 routes:' "$output_file"; then
+        pass "empirical IPv6 state reported"
+    else
+        fail "empirical IPv6 state reported"
+        sed 's/^/       /' "$output_file"
+    fi
+}
+
 test_root_check() {
     echo
     echo "=== ROOT CHECK ==="
@@ -307,6 +355,7 @@ main() {
     test_basic_cli
     test_argument_validation
     test_config_validation
+    test_detection_output
     test_root_check
     test_process_lock
 
