@@ -163,26 +163,26 @@ run_cloud_init_wait_case() (
     readonly CLOUD_INIT_WAIT_TIMEOUT_SECONDS=600
 
     # Called indirectly by the dynamically sourced function under test.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     info() {
         printf '[INFO] %s\n' "$*"
     }
 
     # Called indirectly by the dynamically sourced function under test.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     warn() {
         printf '[WARN] %s\n' "$*"
     }
 
     # Called indirectly by the dynamically sourced function under test.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     die() {
         printf '[ERROR] %s\n' "$*" >&2
         exit 1
     }
 
     # Called indirectly by the dynamically sourced function under test.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     timeout() {
         return "$simulated_exit_code"
     }
