@@ -1,0 +1,28 @@
+# Local/private configuration
+bootstrap.local.conf
+
+# Environment files
+.env
+.env.*
+
+# Python environments, if ever used for tooling/tests
+.venv/
+venv/
+
+# Test/cache artifacts
+__pycache__/
+.pytest_cache/
+.coverage
+coverage/
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+*.bak
+*~
