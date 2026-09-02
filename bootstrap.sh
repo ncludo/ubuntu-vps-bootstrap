@@ -704,10 +704,10 @@ detect_package_state() {
             DEBIAN_FRONTEND=noninteractive \
             LC_ALL=C \
             apt-get \
-                --simulate \
-                -o Debug::NoLocking=1 \
-                upgrade \
-                --with-new-pkgs 2>/dev/null
+            --simulate \
+            -o Debug::NoLocking=1 \
+            upgrade \
+            --with-new-pkgs 2>/dev/null
     ); then
         CURRENT_UPGRADEABLE_COUNT=$(
             grep -c '^Inst ' <<<"$simulation" || true
@@ -923,8 +923,8 @@ apt_get() {
         DEBIAN_FRONTEND=noninteractive \
         LC_ALL=C \
         apt-get \
-            -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT_SECONDS}" \
-            "$@"
+        -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT_SECONDS}" \
+        "$@"
 }
 
 apt_get_dpkg_safe() {
