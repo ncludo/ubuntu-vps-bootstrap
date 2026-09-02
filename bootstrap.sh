@@ -269,8 +269,7 @@ validate_boolean() {
     local value=$2
 
     case "$value" in
-        true | false)
-            ;;
+        true | false) ;;
         *)
             die "$name must be 'true' or 'false'; got '$value'."
             ;;
@@ -295,8 +294,7 @@ validate_timezone() {
 
 validate_swap_config() {
     case "$SWAP_MODE" in
-        auto | fixed | disabled)
-            ;;
+        auto | fixed | disabled) ;;
         *)
             die "SWAP_MODE must be auto, fixed, or disabled; got '$SWAP_MODE'."
             ;;

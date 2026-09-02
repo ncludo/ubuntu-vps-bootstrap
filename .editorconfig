@@ -19,3 +19,4 @@ end_of_line = crlf
 indent_style = space
 indent_size = 4
 shell_variant = bash
+switch_case_indent = true

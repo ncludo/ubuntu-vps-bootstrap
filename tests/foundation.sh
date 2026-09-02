@@ -3,7 +3,8 @@
 set -Eeuo pipefail
 
 readonly TEST_NAME="foundation"
-readonly PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly PROJECT_ROOT
 readonly BOOTSTRAP="${PROJECT_ROOT}/bootstrap.sh"
 
 PASS=0
