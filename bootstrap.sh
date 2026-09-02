@@ -437,7 +437,7 @@ validate_extra_packages() {
     done
 
     for package in "${EXTRA_PACKAGES[@]}"; do
-        if ! dpkg --validate-thing pkgname "$package" >/dev/null 2>&1; then
+        if ! dpkg --validate-pkgname "$package" >/dev/null 2>&1; then
             die "Invalid package name in EXTRA_PACKAGES: '$package'."
         fi
 
