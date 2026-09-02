@@ -83,6 +83,21 @@ expect_ok() {
     fi
 }
 
+expect_ok_contains() {
+    local name=$1
+    local expected_text=$2
+    shift 2
+
+    local output_file="$TMP_DIR/output"
+
+    if run_capture "$output_file" "$@" &&
+        grep -Fq -- "$expected_text" "$output_file"; then
+        pass "$name"
+    else
+        fail "$name"
+        sed 's/^/       /' "$output_file"
+    fi
+}
 expect_fail() {
     local name=$1
     shift
@@ -118,6 +133,65 @@ expect_fail_contains() {
     fi
 }
 
+run_cloud_init_wait_case() (
+    local simulated_exit_code=$1
+    local function_file="$TMP_DIR/wait-for-cloud-init.sh"
+    local fake_bin="$TMP_DIR/fake-bin"
+
+    mkdir -p "$fake_bin"
+
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'exit 0' \
+        >"$fake_bin/cloud-init"
+
+    chmod 755 "$fake_bin/cloud-init"
+
+    sed -n '/^wait_for_cloud_init() {/,/^apt_get() {/p' "$BOOTSTRAP" |
+        sed '$d' >"$function_file"
+
+    if [[ ! -s $function_file ]]; then
+        printf 'ERROR: unable to extract wait_for_cloud_init().\n' >&2
+        exit 1
+    fi
+
+    PATH="$fake_bin:$PATH"
+    export PATH
+
+    # Used indirectly by the dynamically sourced function under test.
+    # shellcheck disable=SC2034
+    readonly CLOUD_INIT_WAIT_TIMEOUT_SECONDS=600
+
+    # Called indirectly by the dynamically sourced function under test.
+    # shellcheck disable=SC2329
+    info() {
+        printf '[INFO] %s\n' "$*"
+    }
+
+    # Called indirectly by the dynamically sourced function under test.
+    # shellcheck disable=SC2329
+    warn() {
+        printf '[WARN] %s\n' "$*"
+    }
+
+    # Called indirectly by the dynamically sourced function under test.
+    # shellcheck disable=SC2329
+    die() {
+        printf '[ERROR] %s\n' "$*" >&2
+        exit 1
+    }
+
+    # Called indirectly by the dynamically sourced function under test.
+    # shellcheck disable=SC2329
+    timeout() {
+        return "$simulated_exit_code"
+    }
+
+    # shellcheck disable=SC1090
+    source "$function_file"
+
+    wait_for_cloud_init
+)
 test_basic_cli() {
     echo "=== BASIC CLI ==="
 
@@ -323,6 +397,35 @@ test_detection_output() {
     fi
 }
 
+test_cloud_init_wait_exit_codes() {
+    echo
+    echo "=== CLOUD-INIT WAIT EXIT CODES ==="
+
+    expect_ok_contains \
+        "cloud-init exit 0 accepted" \
+        "cloud-init completed successfully." \
+        run_cloud_init_wait_case 0
+
+    expect_ok_contains \
+        "cloud-init exit 2 treated as recoverable" \
+        "cloud-init completed with recoverable errors (exit=2); continuing." \
+        run_cloud_init_wait_case 2
+
+    expect_fail_contains \
+        "cloud-init exit 1 rejected" \
+        "cloud-init reported a critical failure (exit=1)." \
+        run_cloud_init_wait_case 1
+
+    expect_fail_contains \
+        "cloud-init timeout rejected" \
+        "Timed out waiting for cloud-init after 600 seconds." \
+        run_cloud_init_wait_case 124
+
+    expect_fail_contains \
+        "unexpected cloud-init exit rejected" \
+        "cloud-init wait failed with unexpected exit code 125." \
+        run_cloud_init_wait_case 125
+}
 test_root_check() {
     echo
     echo "=== ROOT CHECK ==="
@@ -393,6 +496,7 @@ main() {
     test_argument_validation
     test_config_validation
     test_detection_output
+    test_cloud_init_wait_exit_codes
     test_root_check
     test_process_lock
 

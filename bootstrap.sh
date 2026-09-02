@@ -901,21 +901,32 @@ wait_for_cloud_init() {
 
     info "Waiting for cloud-init to finish."
 
+    local exit_code=0
+
     if timeout \
         --foreground \
         "${CLOUD_INIT_WAIT_TIMEOUT_SECONDS}s" \
         cloud-init status --wait; then
         info "cloud-init completed successfully."
         return
+    else
+        exit_code=$?
     fi
 
-    local exit_code=$?
-
-    if ((exit_code == 124)); then
-        die "Timed out waiting for cloud-init after ${CLOUD_INIT_WAIT_TIMEOUT_SECONDS} seconds."
-    fi
-
-    warn "cloud-init completed with a non-zero status (${exit_code}); continuing after completion."
+    case "$exit_code" in
+        2)
+            warn "cloud-init completed with recoverable errors (exit=2); continuing."
+            ;;
+        124)
+            die "Timed out waiting for cloud-init after ${CLOUD_INIT_WAIT_TIMEOUT_SECONDS} seconds."
+            ;;
+        1)
+            die "cloud-init reported a critical failure (exit=1)."
+            ;;
+        *)
+            die "cloud-init wait failed with unexpected exit code ${exit_code}."
+            ;;
+    esac
 }
 
 apt_get() {
