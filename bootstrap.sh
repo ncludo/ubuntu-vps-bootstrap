@@ -14,6 +14,7 @@ readonly APT_UPDATE_LOCK_RETRY_SECONDS=5
 readonly CLOUD_INIT_WAIT_TIMEOUT_SECONDS=600
 readonly SWAP_FILE_PATH="/swapfile"
 readonly SWAP_DISK_RESERVE_MIB=1024
+readonly IPV6_SYSCTL_FILE="/etc/sysctl.d/99-ubuntu-vps-bootstrap-ipv6.conf"
 
 readonly -a BASE_PACKAGES=(
     ca-certificates
@@ -146,7 +147,7 @@ Notes:
   Configuration files are trusted Bash configuration and are sourced
   with root privileges.
 
-  Apply mode currently configures packages/system updates, timezone/NTP, and swap.
+  Apply mode currently configures packages/system updates, timezone/NTP, swap, and IPv6 disable.
   Other baseline modules remain under development.
 EOF
 }
@@ -274,6 +275,8 @@ require_commands() {
         stat
         swapoff
         swapon
+        mv
+        sysctl
     )
 
     local command_name
@@ -1349,6 +1352,128 @@ apply_swap() {
     info "Swap module completed."
 }
 
+ipv6_runtime_disabled() {
+    [[ $CURRENT_IPV6_SYSCTL_AVAILABLE == true ]] || return 1
+    ((${#CURRENT_IPV6_DISABLE_STATE[@]} > 0)) || return 1
+
+    local state=""
+
+    for state in "${CURRENT_IPV6_DISABLE_STATE[@]}"; do
+        [[ ${state##*=} == 1 ]] || return 1
+    done
+
+    ((${#CURRENT_IPV6_ADDRESSES[@]} == 0)) || return 1
+    ((${#CURRENT_IPV6_ROUTES[@]} == 0)) || return 1
+
+    return 0
+}
+
+ipv6_persistent_config_matches() {
+    [[ -f $IPV6_SYSCTL_FILE ]] || return 1
+
+    local expected=""
+    local actual=""
+
+    expected=$'net.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1'
+    actual=$(<"$IPV6_SYSCTL_FILE")
+
+    [[ $actual == "$expected" ]]
+}
+
+write_ipv6_sysctl_config() {
+    [[ -d /etc/sysctl.d ]] ||
+        die "/etc/sysctl.d does not exist."
+
+    local temp_file=""
+
+    temp_file=$(
+        mktemp \
+            /etc/sysctl.d/.ubuntu-vps-bootstrap-ipv6.XXXXXX
+    )
+
+    if ! printf '%s\n' \
+        'net.ipv6.conf.all.disable_ipv6 = 1' \
+        'net.ipv6.conf.default.disable_ipv6 = 1' \
+        >"$temp_file"; then
+        rm -f "$temp_file"
+        die "Failed to write temporary IPv6 sysctl configuration."
+    fi
+
+    chmod 644 "$temp_file"
+
+    if ! mv "$temp_file" "$IPV6_SYSCTL_FILE"; then
+        rm -f "$temp_file"
+        die "Failed to install IPv6 sysctl configuration."
+    fi
+}
+
+apply_ipv6_disabled() {
+    info "Starting mandatory IPv6-disable module."
+
+    detect_ipv6_state
+
+    if [[ $CURRENT_IPV6_SYSCTL_AVAILABLE != true ]]; then
+        if ((${#CURRENT_IPV6_ADDRESSES[@]} == 0 && ${#CURRENT_IPV6_ROUTES[@]} == 0)); then
+            info "IPv6 sysctl is unavailable and no IPv6 network state is present."
+            info "IPv6-disable module completed."
+            return
+        fi
+
+        die "IPv6 sysctl is unavailable while IPv6 network state is present."
+    fi
+
+    if [[ -n ${SSH_CONNECTION:-} ]]; then
+        local -a ssh_parts=()
+        local ssh_server_address=""
+
+        read -r -a ssh_parts <<<"$SSH_CONNECTION"
+
+        if ((${#ssh_parts[@]} >= 4)); then
+            ssh_server_address=${ssh_parts[2]}
+
+            if [[ $ssh_server_address == *:* ]]; then
+                die \
+                    "Current SSH session uses IPv6 (${ssh_server_address}); refusing to disable IPv6."
+            fi
+        fi
+    fi
+
+    if ipv6_persistent_config_matches; then
+        info "Persistent IPv6-disable configuration is already correct."
+    else
+        info "Writing persistent IPv6-disable configuration: $IPV6_SYSCTL_FILE"
+        write_ipv6_sysctl_config
+    fi
+
+    if ipv6_runtime_disabled; then
+        info "IPv6 is already disabled at runtime."
+    else
+        info "Disabling IPv6 on current and future interfaces."
+
+        sysctl -q -w net.ipv6.conf.all.disable_ipv6=1
+        sysctl -q -w net.ipv6.conf.default.disable_ipv6=1
+
+        detect_ipv6_state
+
+        if ! ipv6_runtime_disabled; then
+            die "IPv6 runtime verification failed."
+        fi
+    fi
+
+    detect_ipv6_state
+
+    printf '\n'
+    printf '=== IPv6 AFTER APPLY ===\n'
+    printf 'IPv6 sysctl available:   %s\n' "$CURRENT_IPV6_SYSCTL_AVAILABLE"
+    printf 'IPv6 disable state:      %s\n' "${CURRENT_IPV6_DISABLE_STATE[*]:-<none>}"
+    printf 'IPv6 addresses:          %s\n' "${#CURRENT_IPV6_ADDRESSES[@]}"
+    printf 'IPv6 global addresses:   %s\n' "${#CURRENT_IPV6_GLOBAL_ADDRESSES[@]}"
+    printf 'IPv6 routes:             %s\n' "${#CURRENT_IPV6_ROUTES[@]}"
+    printf 'Persistent config:       %s\n' "$IPV6_SYSCTL_FILE"
+
+    info "IPv6-disable module completed."
+}
+
 run_current_mode() {
     case "$RUN_MODE" in
         apply)
@@ -1356,6 +1481,7 @@ run_current_mode() {
             apply_packages_and_updates
             apply_timezone_and_ntp
             apply_swap
+            apply_ipv6_disabled
             ;;
 
         plan)
