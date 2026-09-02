@@ -34,29 +34,5 @@ jobs:
           shellcheck --version
           shfmt --version
 
-      - name: Bash syntax
-        shell: bash
-        run: |
-          set -euo pipefail
-          while IFS= read -r -d '' file; do
-            echo "Checking syntax: $file"
-            bash -n "$file"
-          done < <(find . -type f -name '*.sh' -not -path './.git/*' -print0)
-
-      - name: ShellCheck
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -d '' files < <(find . -type f -name '*.sh' -not -path './.git/*' -print0)
-          if ((${#files[@]} > 0)); then
-            shellcheck "${files[@]}"
-          fi
-
-      - name: shfmt
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -d '' files < <(find . -type f -name '*.sh' -not -path './.git/*' -print0)
-          if ((${#files[@]} > 0)); then
-            shfmt -d "${files[@]}"
-          fi
+      - name: Run static checks
+        run: ./tests/static.sh
