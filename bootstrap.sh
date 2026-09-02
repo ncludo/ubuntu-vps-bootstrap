@@ -144,8 +144,8 @@ Notes:
   Configuration files are trusted Bash configuration and are sourced
   with root privileges.
 
-  This development revision implements only the bootstrap foundation.
-  It does not yet modify system configuration.
+  Apply mode currently configures packages/system updates and timezone/NTP.
+  Other baseline modules remain under development.
 EOF
 }
 
@@ -1062,11 +1062,56 @@ apply_packages_and_updates() {
     info "Packages/system-update module completed."
 }
 
+apply_timezone_and_ntp() {
+    info "Starting timezone/NTP module."
+
+    detect_time_state
+
+    if [[ $CURRENT_TIMEZONE == "$TIMEZONE" ]]; then
+        info "Timezone is already configured: $TIMEZONE"
+    else
+        info "Setting timezone: ${CURRENT_TIMEZONE} -> ${TIMEZONE}"
+        timedatectl set-timezone "$TIMEZONE"
+    fi
+
+    detect_time_state
+
+    if [[ $CURRENT_NTP_ENABLED == yes ]]; then
+        info "Network time synchronization is already enabled."
+    else
+        info "Enabling network time synchronization."
+        timedatectl set-ntp true
+    fi
+
+    detect_time_state
+
+    [[ $CURRENT_TIMEZONE == "$TIMEZONE" ]] ||
+        die "Timezone verification failed: expected '$TIMEZONE', got '$CURRENT_TIMEZONE'."
+
+    [[ $CURRENT_NTP_ENABLED == yes ]] ||
+        die "NTP verification failed: expected enabled, got '$CURRENT_NTP_ENABLED'."
+
+    printf '\n'
+    printf '=== TIME / NTP AFTER APPLY ===\n'
+    printf 'Timezone:                %s\n' "$CURRENT_TIMEZONE"
+    printf 'NTP enabled:             %s\n' "$CURRENT_NTP_ENABLED"
+    printf 'NTP synchronized:        %s\n' "$CURRENT_NTP_SYNCHRONIZED"
+
+    if [[ $CURRENT_NTP_SYNCHRONIZED == yes ]]; then
+        info "System clock is synchronized."
+    else
+        warn "NTP is enabled but the system clock is not synchronized yet."
+    fi
+
+    info "Timezone/NTP module completed."
+}
+
 run_current_mode() {
     case "$RUN_MODE" in
         apply)
             info "Apply mode selected."
             apply_packages_and_updates
+            apply_timezone_and_ntp
             ;;
 
         plan)
@@ -1076,7 +1121,7 @@ run_current_mode() {
 
         audit)
             info "Audit mode selected."
-            info "Package state was inspected read-only; no system changes were made."
+            info "System state was inspected read-only; no system changes were made."
             ;;
 
         *)
