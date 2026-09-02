@@ -14,3 +14,8 @@ end_of_line = crlf
 
 [*.{bat,cmd}]
 end_of_line = crlf
+
+[*.sh]
+indent_style = space
+indent_size = 4
+shell_variant = bash
