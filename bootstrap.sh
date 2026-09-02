@@ -987,20 +987,13 @@ upgrade_system_packages() {
     info "Safe package upgrade completed."
 }
 
-collect_missing_packages() {
-    local -n result_ref=$1
-
-    result_ref=(
-        "${CURRENT_MISSING_BASE_PACKAGES[@]}"
-        "${CURRENT_MISSING_EXTRA_PACKAGES[@]}"
-    )
-}
-
 install_missing_packages() {
     detect_package_state
 
-    local -a missing_packages=()
-    collect_missing_packages missing_packages
+    local -a missing_packages=(
+        "${CURRENT_MISSING_BASE_PACKAGES[@]}"
+        "${CURRENT_MISSING_EXTRA_PACKAGES[@]}"
+    )
 
     if ((${#missing_packages[@]} == 0)); then
         info "All configured base and extra packages are already installed."
