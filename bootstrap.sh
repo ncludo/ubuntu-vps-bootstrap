@@ -87,6 +87,12 @@ declare -a CURRENT_IPV6_ADDRESSES=()
 declare -a CURRENT_IPV6_GLOBAL_ADDRESSES=()
 declare -a CURRENT_IPV6_ROUTES=()
 
+readonly UFW_MANAGED_MARKER="ubuntu-vps-bootstrap-managed"
+declare -a DESIRED_UFW_TCP_PORTS=()
+declare -a DESIRED_UFW_UDP_PORTS=()
+declare -a DETECTED_SSH_CONFIGURED_PORTS=()
+declare -a DETECTED_SSH_LISTEN_PORTS=()
+
 log() {
     local level=$1
     shift
@@ -1474,6 +1480,559 @@ apply_ipv6_disabled() {
     info "IPv6-disable module completed."
 }
 
+ufw_cmd() {
+    LC_ALL=C ufw "$@"
+}
+
+require_ufw_runtime_tools() {
+    local command_name=""
+
+    for command_name in ufw ss awk sort grep; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "Required UFW-module command not found: $command_name"
+    done
+}
+
+find_sshd_binary() {
+    local sshd_bin=""
+
+    sshd_bin=$(command -v sshd 2>/dev/null || true)
+
+    if [[ -n $sshd_bin ]]; then
+        printf '%s\n' "$sshd_bin"
+        return 0
+    fi
+
+    if [[ -x /usr/sbin/sshd ]]; then
+        printf '%s\n' /usr/sbin/sshd
+        return 0
+    fi
+
+    return 1
+}
+
+read_ufw_default_policy() {
+    local direction=$1
+    local key="DEFAULT_${direction}_POLICY"
+    local line=""
+    local value=""
+
+    line=$(
+        grep -m1 "^${key}=" /etc/default/ufw 2>/dev/null || true
+    )
+
+    [[ -n $line ]] ||
+        die "Unable to read ${key} from /etc/default/ufw."
+
+    value=${line#*=}
+    value=${value#\"}
+    value=${value%\"}
+    value=${value#\'}
+    value=${value%\'}
+
+    printf '%s\n' "$value"
+}
+
+ufw_is_active() {
+    ufw_cmd status 2>/dev/null |
+        grep -Fxq 'Status: active'
+}
+
+resolve_ufw_desired_rules() {
+    require_ufw_runtime_tools
+
+    local sshd_bin=""
+    local sshd_output=""
+    local ss_output=""
+    local port=""
+
+    sshd_bin=$(find_sshd_binary) ||
+        die "Unable to find sshd binary."
+
+    if ! sshd_output=$("$sshd_bin" -T 2>&1); then
+        printf '%s\n' "$sshd_output" >&2
+        die "Unable to obtain effective sshd configuration."
+    fi
+
+    DETECTED_SSH_CONFIGURED_PORTS=()
+
+    mapfile -t DETECTED_SSH_CONFIGURED_PORTS < <(
+        awk '
+            $1 == "port" && $2 ~ /^[0-9]+$/ {
+                print $2
+            }
+        ' <<<"$sshd_output" |
+            sort -nu
+    )
+
+    ((${#DETECTED_SSH_CONFIGURED_PORTS[@]} > 0)) ||
+        die "No configured SSH port detected via sshd -T."
+
+    if ! ss_output=$(ss -H -ltnp 2>&1); then
+        printf '%s\n' "$ss_output" >&2
+        die "Unable to inspect listening TCP sockets."
+    fi
+
+    DETECTED_SSH_LISTEN_PORTS=()
+
+    mapfile -t DETECTED_SSH_LISTEN_PORTS < <(
+        awk '
+            /sshd/ {
+                endpoint=$4
+                sub(/^.*:/, "", endpoint)
+
+                if (endpoint ~ /^[0-9]+$/)
+                    print endpoint
+            }
+        ' <<<"$ss_output" |
+            sort -nu
+    )
+
+    ((${#DETECTED_SSH_LISTEN_PORTS[@]} > 0)) ||
+        die "No listening sshd TCP socket detected; refusing firewall operation."
+
+    local -A tcp_seen=()
+    local -A udp_seen=()
+
+    for port in \
+        "${DETECTED_SSH_CONFIGURED_PORTS[@]}" \
+        "${DETECTED_SSH_LISTEN_PORTS[@]}" \
+        "${ALLOW_TCP_PORTS[@]}"; do
+
+        [[ $port =~ ^[1-9][0-9]{0,4}$ ]] ||
+            die "Invalid resolved TCP port: '$port'."
+
+        ((10#$port <= 65535)) ||
+            die "Resolved TCP port is out of range: '$port'."
+
+        tcp_seen[$port]=1
+    done
+
+    for port in "${ALLOW_UDP_PORTS[@]}"; do
+        udp_seen[$port]=1
+    done
+
+    DESIRED_UFW_TCP_PORTS=()
+
+    mapfile -t DESIRED_UFW_TCP_PORTS < <(
+        printf '%s\n' "${!tcp_seen[@]}" |
+            sort -n
+    )
+
+    DESIRED_UFW_UDP_PORTS=()
+
+    if ((${#udp_seen[@]} > 0)); then
+        mapfile -t DESIRED_UFW_UDP_PORTS < <(
+            printf '%s\n' "${!udp_seen[@]}" |
+                sort -n
+        )
+    fi
+
+    info \
+        "Configured SSH port(s): ${DETECTED_SSH_CONFIGURED_PORTS[*]}"
+
+    info \
+        "Listening SSH port(s): ${DETECTED_SSH_LISTEN_PORTS[*]}"
+}
+
+ufw_rule_comment() {
+    local protocol=$1
+    local port=$2
+
+    printf '%s-%s-%s\n' \
+        "$UFW_MANAGED_MARKER" \
+        "$protocol" \
+        "$port"
+}
+
+ufw_added_rule_matches() {
+    local protocol=$1
+    local port=$2
+    local comment=$3
+    local line=""
+
+    while IFS= read -r line; do
+        [[ $line == ufw\ * ]] || continue
+        [[ $line == *"$comment"* ]] || continue
+        [[ $line == *"allow ${port}/${protocol}"* ]] || continue
+
+        return 0
+    done < <(
+        ufw_cmd show added 2>/dev/null || true
+    )
+
+    return 1
+}
+
+ufw_status_line_is_desired() {
+    local line=$1
+    local port=""
+    local comment=""
+
+    for port in "${DESIRED_UFW_TCP_PORTS[@]}"; do
+        comment=$(ufw_rule_comment tcp "$port")
+
+        if [[ $line == *"$comment"* &&
+            $line == *"${port}/tcp"* &&
+            $line == *"ALLOW IN"* ]]; then
+            return 0
+        fi
+    done
+
+    for port in "${DESIRED_UFW_UDP_PORTS[@]}"; do
+        comment=$(ufw_rule_comment udp "$port")
+
+        if [[ $line == *"$comment"* &&
+            $line == *"${port}/udp"* &&
+            $line == *"ALLOW IN"* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+snapshot_foreign_ufw_rules() {
+    local line=""
+
+    while IFS= read -r line; do
+        [[ $line == ufw\ * ]] || continue
+
+        [[ $line != *"$UFW_MANAGED_MARKER"* ]] ||
+            continue
+
+        printf '%s\n' "$line"
+    done < <(
+        ufw_cmd show added 2>/dev/null || true
+    ) |
+        sort
+}
+
+add_missing_managed_ufw_rules() {
+    local protocol=""
+    local port=""
+    local comment=""
+
+    for port in "${DESIRED_UFW_TCP_PORTS[@]}"; do
+        protocol=tcp
+        comment=$(ufw_rule_comment "$protocol" "$port")
+
+        if ufw_added_rule_matches \
+            "$protocol" \
+            "$port" \
+            "$comment"; then
+
+            info \
+                "Managed UFW rule already present: ${port}/${protocol}"
+            continue
+        fi
+
+        info \
+            "Adding managed UFW rule: allow ${port}/${protocol}"
+
+        ufw_cmd allow \
+            "${port}/${protocol}" \
+            comment "$comment"
+
+        ufw_added_rule_matches \
+            "$protocol" \
+            "$port" \
+            "$comment" ||
+            die \
+                "Managed UFW rule verification failed after add: ${port}/${protocol}"
+    done
+
+    for port in "${DESIRED_UFW_UDP_PORTS[@]}"; do
+        protocol=udp
+        comment=$(ufw_rule_comment "$protocol" "$port")
+
+        if ufw_added_rule_matches \
+            "$protocol" \
+            "$port" \
+            "$comment"; then
+
+            info \
+                "Managed UFW rule already present: ${port}/${protocol}"
+            continue
+        fi
+
+        info \
+            "Adding managed UFW rule: allow ${port}/${protocol}"
+
+        ufw_cmd allow \
+            "${port}/${protocol}" \
+            comment "$comment"
+
+        ufw_added_rule_matches \
+            "$protocol" \
+            "$port" \
+            "$comment" ||
+            die \
+                "Managed UFW rule verification failed after add: ${port}/${protocol}"
+    done
+}
+
+verify_desired_ufw_rules_added() {
+    local protocol=""
+    local port=""
+    local comment=""
+
+    for port in "${DESIRED_UFW_TCP_PORTS[@]}"; do
+        protocol=tcp
+        comment=$(ufw_rule_comment "$protocol" "$port")
+
+        ufw_added_rule_matches \
+            "$protocol" \
+            "$port" \
+            "$comment" ||
+            die \
+                "Required managed UFW rule is missing: ${port}/${protocol}"
+    done
+
+    for port in "${DESIRED_UFW_UDP_PORTS[@]}"; do
+        protocol=udp
+        comment=$(ufw_rule_comment "$protocol" "$port")
+
+        ufw_added_rule_matches \
+            "$protocol" \
+            "$port" \
+            "$comment" ||
+            die \
+                "Required managed UFW rule is missing: ${port}/${protocol}"
+    done
+}
+
+delete_stale_managed_ufw_rules() {
+    local status=""
+    local line=""
+    local highest_number=0
+    local highest_line=""
+    local rule_number=0
+
+    while true; do
+        status=$(ufw_cmd status numbered)
+
+        highest_number=0
+        highest_line=""
+
+        while IFS= read -r line; do
+            [[ $line == *"$UFW_MANAGED_MARKER"* ]] ||
+                continue
+
+            if ufw_status_line_is_desired "$line"; then
+                continue
+            fi
+
+            if [[ $line =~ ^[[:space:]]*\[[[:space:]]*([0-9]+)\] ]]; then
+                rule_number=${BASH_REMATCH[1]}
+            else
+                die \
+                    "Unable to parse stale managed UFW rule number: $line"
+            fi
+
+            if ((rule_number > highest_number)); then
+                highest_number=$rule_number
+                highest_line=$line
+            fi
+        done <<<"$status"
+
+        ((highest_number > 0)) || break
+
+        info \
+            "Deleting stale managed UFW rule #${highest_number}: ${highest_line}"
+
+        ufw_cmd --force delete "$highest_number"
+    done
+}
+
+audit_ufw_firewall() {
+    resolve_ufw_desired_rules
+
+    local audit_ok=true
+    local input_policy=""
+    local output_policy=""
+    local forward_policy=""
+    local status=""
+    local line=""
+    local port=""
+    local comment=""
+
+    input_policy=$(read_ufw_default_policy INPUT)
+    output_policy=$(read_ufw_default_policy OUTPUT)
+    forward_policy=$(read_ufw_default_policy FORWARD)
+
+    if ! ufw_is_active; then
+        warn "UFW audit: firewall is inactive."
+        audit_ok=false
+    fi
+
+    if [[ $input_policy != DROP ]]; then
+        warn \
+            "UFW audit: incoming policy is ${input_policy}, expected DROP."
+        audit_ok=false
+    fi
+
+    if [[ $output_policy != ACCEPT ]]; then
+        warn \
+            "UFW audit: outgoing policy is ${output_policy}, expected ACCEPT."
+        audit_ok=false
+    fi
+
+    status=$(
+        ufw_cmd status numbered 2>/dev/null || true
+    )
+
+    for port in "${DESIRED_UFW_TCP_PORTS[@]}"; do
+        comment=$(ufw_rule_comment tcp "$port")
+
+        if ! grep -F "$comment" <<<"$status" |
+            grep -F "${port}/tcp" |
+            grep -Fq 'ALLOW IN'; then
+
+            warn \
+                "UFW audit: desired managed rule missing: ${port}/tcp"
+            audit_ok=false
+        fi
+    done
+
+    for port in "${DESIRED_UFW_UDP_PORTS[@]}"; do
+        comment=$(ufw_rule_comment udp "$port")
+
+        if ! grep -F "$comment" <<<"$status" |
+            grep -F "${port}/udp" |
+            grep -Fq 'ALLOW IN'; then
+
+            warn \
+                "UFW audit: desired managed rule missing: ${port}/udp"
+            audit_ok=false
+        fi
+    done
+
+    while IFS= read -r line; do
+        [[ $line == *"$UFW_MANAGED_MARKER"* ]] ||
+            continue
+
+        if ! ufw_status_line_is_desired "$line"; then
+            warn \
+                "UFW audit: stale managed rule present: $line"
+            audit_ok=false
+        fi
+    done <<<"$status"
+
+    printf '\n'
+    printf '=== UFW AUDIT ===\n'
+
+    printf 'Status:                  %s\n' \
+        "$(ufw_is_active && printf active || printf inactive)"
+
+    printf 'Default incoming:        %s\n' \
+        "$input_policy"
+
+    printf 'Default outgoing:        %s\n' \
+        "$output_policy"
+
+    printf 'Default forward:         %s (preserved/unmanaged)\n' \
+        "$forward_policy"
+
+    printf 'Configured SSH ports:    %s\n' \
+        "${DETECTED_SSH_CONFIGURED_PORTS[*]}"
+
+    printf 'Listening SSH ports:     %s\n' \
+        "${DETECTED_SSH_LISTEN_PORTS[*]}"
+
+    printf 'Desired TCP ports:       %s\n' \
+        "${DESIRED_UFW_TCP_PORTS[*]:-<none>}"
+
+    printf 'Desired UDP ports:       %s\n' \
+        "${DESIRED_UFW_UDP_PORTS[*]:-<none>}"
+
+    if [[ $audit_ok == true ]]; then
+        printf 'UFW AUDIT:               OK\n'
+        return 0
+    fi
+
+    printf 'UFW AUDIT:               DRIFT\n'
+    return 1
+}
+
+apply_ufw_firewall() {
+    info "Starting UFW firewall module."
+
+    resolve_ufw_desired_rules
+
+    local forward_before=""
+    local forward_after=""
+    local foreign_before=""
+    local foreign_after=""
+    local input_policy=""
+    local output_policy=""
+
+    forward_before=$(read_ufw_default_policy FORWARD)
+    foreign_before=$(snapshot_foreign_ufw_rules)
+
+    # Safety order:
+    # 1. ADD desired rules, including configured/listening SSH ports.
+    # 2. Verify them.
+    # 3. Reconcile INPUT/OUTPUT defaults.
+    # 4. Enable UFW.
+    # 5. DELETE stale managed rules.
+
+    add_missing_managed_ufw_rules
+    verify_desired_ufw_rules_added
+
+    input_policy=$(read_ufw_default_policy INPUT)
+
+    if [[ $input_policy == DROP ]]; then
+        info "UFW default incoming policy is already deny."
+    else
+        info "Setting UFW default incoming policy to deny."
+        ufw_cmd default deny incoming
+    fi
+
+    output_policy=$(read_ufw_default_policy OUTPUT)
+
+    if [[ $output_policy == ACCEPT ]]; then
+        info "UFW default outgoing policy is already allow."
+    else
+        info "Setting UFW default outgoing policy to allow."
+        ufw_cmd default allow outgoing
+    fi
+
+    # Forward/routed policy is intentionally NOT modified.
+
+    if ufw_is_active; then
+        info "UFW is already active."
+    else
+        info \
+            "Enabling UFW after required SSH rule verification."
+
+        ufw_cmd --force enable
+    fi
+
+    ufw_is_active ||
+        die "UFW failed to become active."
+
+    delete_stale_managed_ufw_rules
+
+    forward_after=$(read_ufw_default_policy FORWARD)
+
+    [[ $forward_after == "$forward_before" ]] ||
+        die \
+            "UFW forward policy changed unexpectedly: ${forward_before} -> ${forward_after}"
+
+    foreign_after=$(snapshot_foreign_ufw_rules)
+
+    [[ $foreign_after == "$foreign_before" ]] ||
+        die \
+            "Foreign/unmanaged UFW rules changed unexpectedly."
+
+    if ! audit_ufw_firewall; then
+        die "UFW post-apply audit failed."
+    fi
+
+    info "UFW firewall module completed."
+}
+
 run_current_mode() {
     case "$RUN_MODE" in
         apply)
@@ -1482,6 +2041,7 @@ run_current_mode() {
             apply_timezone_and_ntp
             apply_swap
             apply_ipv6_disabled
+            apply_ufw_firewall
             ;;
 
         plan)
@@ -1491,6 +2051,11 @@ run_current_mode() {
 
         audit)
             info "Audit mode selected."
+
+            if ! audit_ufw_firewall; then
+                warn "UFW audit detected configuration drift."
+            fi
+
             info "System state was inspected read-only; no system changes were made."
             ;;
 
