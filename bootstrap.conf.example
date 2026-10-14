@@ -29,3 +29,10 @@ ALLOW_UDP_PORTS=()
 #     strace
 # )
 EXTRA_PACKAGES=()
+
+# Opt-in on an IPv4-accessible VPS with IPv6 disabled and X11 required.
+# Default false leaves all SSHD settings unmanaged.
+SSHD_X11_IPV4=false
+# On this VPS only, in ignored bootstrap.local.conf:
+# SSHD_X11_IPV4=true
+# EXTRA_PACKAGES+=(xauth xclip)

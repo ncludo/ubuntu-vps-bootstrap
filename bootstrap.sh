@@ -323,6 +323,7 @@ set_default_config() {
     ALLOW_TCP_PORTS=()
     ALLOW_UDP_PORTS=()
     EXTRA_PACKAGES=()
+    SSHD_X11_IPV4=false
 }
 
 load_config() {
@@ -467,6 +468,13 @@ validate_extra_packages() {
     done
 }
 
+validate_sshd_x11_ipv4() {
+    case "$SSHD_X11_IPV4" in
+        true | false) ;;
+        *) die "SSHD_X11_IPV4 must be true or false." ;;
+    esac
+}
+
 validate_config() {
     validate_timezone
 
@@ -486,6 +494,7 @@ validate_config() {
     validate_port_array "ALLOW_TCP_PORTS"
     validate_port_array "ALLOW_UDP_PORTS"
     validate_extra_packages
+    validate_sshd_x11_ipv4
 
     info "Configuration validation passed."
 }
@@ -894,6 +903,8 @@ print_resolved_config() {
     else
         printf '%s\n' "${ALLOW_UDP_PORTS[*]}"
     fi
+
+    printf 'SSHD X11 IPv4:           %s\n' "$SSHD_X11_IPV4"
 
     printf 'Extra packages:          '
     if ((${#RESOLVED_EXTRA_PACKAGES[@]} == 0)); then
@@ -2041,6 +2052,7 @@ run_current_mode() {
             apply_timezone_and_ntp
             apply_swap
             apply_ipv6_disabled
+            bash "$(dirname -- "${BASH_SOURCE[0]}")/modules/sshd-x11.sh" --apply "$SSHD_X11_IPV4"
             apply_ufw_firewall
             ;;
 
@@ -2051,6 +2063,10 @@ run_current_mode() {
 
         audit)
             info "Audit mode selected."
+
+            if ! bash "$(dirname -- "${BASH_SOURCE[0]}")/modules/sshd-x11.sh" --audit "$SSHD_X11_IPV4"; then
+                warn "SSHD X11 IPv4 audit detected drift."
+            fi
 
             if ! audit_ufw_firewall; then
                 warn "UFW audit detected configuration drift."

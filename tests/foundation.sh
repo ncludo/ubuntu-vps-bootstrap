@@ -261,6 +261,7 @@ JOURNAL_MAX_RETENTION="21day"
 
 ALLOW_TCP_PORTS=(80 443)
 ALLOW_UDP_PORTS=(53)
+SSHD_X11_IPV4=true
 
 EXTRA_PACKAGES=(
     tcpdump
@@ -282,7 +283,8 @@ EOF
         grep -q 'Swap mode:.*fixed' "$output_file" &&
         grep -q 'Swap size:.*2G' "$output_file" &&
         grep -q 'Allowed TCP ports:.*80 443' "$output_file" &&
-        grep -q 'Extra packages:.*tcpdump strace' "$output_file"; then
+        grep -q 'Extra packages:.*tcpdump strace' "$output_file" &&
+        grep -q 'SSHD X11 IPv4:.*true' "$output_file"; then
         pass "custom config reflected in resolved configuration"
     else
         fail "custom config reflected in resolved configuration"
@@ -335,6 +337,17 @@ EOF
         "invalid EXTRA_PACKAGES package name rejected" \
         "Invalid package name in EXTRA_PACKAGES" \
         "$BOOTSTRAP" --plan --config "$TMP_DIR/invalid-package.conf"
+}
+
+test_sshd_x11_validation() {
+    echo
+    echo "=== SSHD X11 IPV4 VALIDATION ==="
+
+    cat >"$TMP_DIR/invalid-sshd-x11.conf" <<'EOF'
+SSHD_X11_IPV4="yes"
+EOF
+
+    expect_fail_contains "invalid SSHD X11 setting rejected" "SSHD_X11_IPV4 must be true or false" "$BOOTSTRAP" --plan --config "$TMP_DIR/invalid-sshd-x11.conf"
 }
 
 test_detection_output() {
@@ -495,6 +508,7 @@ main() {
     test_basic_cli
     test_argument_validation
     test_config_validation
+    test_sshd_x11_validation
     test_detection_output
     test_cloud_init_wait_exit_codes
     test_root_check
