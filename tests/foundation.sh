@@ -350,6 +350,34 @@ EOF
     expect_fail_contains "invalid SSHD X11 setting rejected" "SSHD_X11_IPV4 must be true or false" "$BOOTSTRAP" --plan --config "$TMP_DIR/invalid-sshd-x11.conf"
 }
 
+test_extended_profile() {
+    echo
+    echo "=== EXTENDED PROFILE ==="
+
+    local profile
+    profile="$(dirname -- "$BOOTSTRAP")/profiles/extended.conf"
+
+    if ! "$BOOTSTRAP" --plan --config "$profile" >"$TMP_DIR/extended-profile.log" 2>&1; then
+        echo "FAIL: extended profile plan"
+        tail -n 25 "$TMP_DIR/extended-profile.log"
+        return 1
+    fi
+
+    grep -q 'SSHD X11 IPv4:.*true' "$TMP_DIR/extended-profile.log" || return 1
+
+    local extra_line pkg
+    extra_line="$(grep '^Extra packages:' "$TMP_DIR/extended-profile.log")" || return 1
+
+    for pkg in nghttp2-client socat strace tcpdump xauth xclip; do
+        [[ "$extra_line" == *"$pkg"* ]] || {
+            echo "FAIL: missing extended package: $pkg"
+            return 1
+        }
+    done
+
+    echo "PASS: extended profile selection and packages"
+}
+
 test_detection_output() {
     echo
     echo "=== CURRENT STATE DETECTION ==="
@@ -509,6 +537,7 @@ main() {
     test_argument_validation
     test_config_validation
     test_sshd_x11_validation
+    test_extended_profile
     test_detection_output
     test_cloud_init_wait_exit_codes
     test_root_check
