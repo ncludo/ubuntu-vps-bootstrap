@@ -33,6 +33,12 @@ EXTRA_PACKAGES=()
 # Opt-in on an IPv4-accessible VPS with IPv6 disabled and X11 required.
 # Default false leaves all SSHD settings unmanaged.
 SSHD_X11_IPV4=false
+
+# Optional global Git identity for the bootstrap user (root).
+# The general default intentionally leaves it unmanaged.
+GIT_IDENTITY_ENABLE=false
+GIT_IDENTITY_NAME=""
+GIT_IDENTITY_EMAIL=""
 # On this VPS only, in ignored bootstrap.local.conf:
 # SSHD_X11_IPV4=true
 # EXTRA_PACKAGES+=(xauth xclip)

@@ -324,6 +324,9 @@ set_default_config() {
     ALLOW_UDP_PORTS=()
     EXTRA_PACKAGES=()
     SSHD_X11_IPV4=false
+    GIT_IDENTITY_ENABLE=false
+    GIT_IDENTITY_NAME=""
+    GIT_IDENTITY_EMAIL=""
 }
 
 load_config() {
@@ -495,6 +498,13 @@ validate_config() {
     validate_port_array "ALLOW_UDP_PORTS"
     validate_extra_packages
     validate_sshd_x11_ipv4
+    validate_boolean "GIT_IDENTITY_ENABLE" "$GIT_IDENTITY_ENABLE"
+    if [[ $GIT_IDENTITY_ENABLE == true ]]; then
+        [[ -n $GIT_IDENTITY_NAME && $GIT_IDENTITY_NAME != *[$'\r\n']* && $GIT_IDENTITY_NAME != -* ]] ||
+            die "Invalid GIT_IDENTITY_NAME."
+        [[ $GIT_IDENTITY_EMAIL =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] ||
+            die "Invalid GIT_IDENTITY_EMAIL."
+    fi
 
     info "Configuration validation passed."
 }
@@ -905,6 +915,11 @@ print_resolved_config() {
     fi
 
     printf 'SSHD X11 IPv4:           %s\n' "$SSHD_X11_IPV4"
+    printf 'Git identity enabled:    %s\n' "$GIT_IDENTITY_ENABLE"
+    if [[ $GIT_IDENTITY_ENABLE == true ]]; then
+        printf 'Git identity name:       %s\n' "$GIT_IDENTITY_NAME"
+        printf 'Git identity email:      %s\n' "$GIT_IDENTITY_EMAIL"
+    fi
 
     printf 'Extra packages:          '
     if ((${#RESOLVED_EXTRA_PACKAGES[@]} == 0)); then
@@ -2054,6 +2069,8 @@ run_current_mode() {
             apply_ipv6_disabled
             bash "$(dirname -- "${BASH_SOURCE[0]}")/modules/sshd-x11.sh" --apply "$SSHD_X11_IPV4"
             apply_ufw_firewall
+            bash "$(dirname -- "${BASH_SOURCE[0]}")/modules/git-identity.sh" --apply \
+                "$GIT_IDENTITY_ENABLE" "$GIT_IDENTITY_NAME" "$GIT_IDENTITY_EMAIL"
             ;;
 
         plan)
@@ -2066,6 +2083,11 @@ run_current_mode() {
 
             if ! bash "$(dirname -- "${BASH_SOURCE[0]}")/modules/sshd-x11.sh" --audit "$SSHD_X11_IPV4"; then
                 warn "SSHD X11 IPv4 audit detected drift."
+            fi
+
+            if ! bash "$(dirname -- "${BASH_SOURCE[0]}")/modules/git-identity.sh" --audit \
+                "$GIT_IDENTITY_ENABLE" "$GIT_IDENTITY_NAME" "$GIT_IDENTITY_EMAIL"; then
+                warn "Git identity audit detected drift."
             fi
 
             if ! audit_ufw_firewall; then

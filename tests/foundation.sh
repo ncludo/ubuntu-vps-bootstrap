@@ -364,6 +364,9 @@ test_extended_profile() {
     fi
 
     grep -q 'SSHD X11 IPv4:.*true' "$TMP_DIR/extended-profile.log" || return 1
+    grep -q 'Git identity enabled:.*true' "$TMP_DIR/extended-profile.log" || return 1
+    grep -q 'Git identity name:.*ncludo' "$TMP_DIR/extended-profile.log" || return 1
+    grep -q 'Git identity email:.*109440419+ncludo@users.noreply.github.com' "$TMP_DIR/extended-profile.log" || return 1
 
     local extra_line pkg
     extra_line="$(grep '^Extra packages:' "$TMP_DIR/extended-profile.log")" || return 1
@@ -538,6 +541,11 @@ main() {
     test_config_validation
     test_sshd_x11_validation
     test_extended_profile
+    if bash "$PROJECT_ROOT/tests/git-identity.sh"; then
+        pass "isolated Git identity module"
+    else
+        fail "isolated Git identity module"
+    fi
     test_detection_output
     test_cloud_init_wait_exit_codes
     test_root_check
